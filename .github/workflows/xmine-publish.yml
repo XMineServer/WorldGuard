@@ -1,0 +1,168 @@
+# Публикация нашей сборки WorldGuard в свой Reposilite, раздел-кандидат пары
+# форков `fork-snapshot` (вики, ADR-0056). Координата ru.xmine.thirdparty:worldguard,
+# потребитель - XMineNode (plugins/common.yml).
+#
+# Что в форке изменено: данные регионов лежат внутри каталога мира (патч
+# world-container), каталог мира берётся через Bukkit API.
+#
+# ЭТОТ РЕПОЗИТОРИЙ ПУБЛИЧНЫЙ, поэтому `runs-on` здесь - только раннеры GitHub и
+# никогда `self-hosted` (вики, infra/ci.md, «Граница безопасности: только
+# приватные репозитории»). По той же причине нет триггера `pull_request` - PR из
+# форка исполнял бы свою версию этого файла с нашими секретами, - а job не
+# запускается в форках самого форка.
+#
+# Публикуется любая ветка `xmine/**`, но закрепляться в потребителе можно только на
+# координату с `xmine/main` (ADR-0060): в версии это `…-xmine-main-…`.
+#
+# Секретов XMINE_MAVEN_USERNAME / XMINE_MAVEN_PASSWORD в репозитории пока нет - их
+# заводит владелец; до тех пор прогон падает на шаге «Fail early without credentials».
+# Прежний xmine-release.yml (релиз GitHub по тегу) этим файлом не затрагивается.
+
+name: XMine - publish WorldGuard
+
+on:
+  push:
+    branches: ['xmine/**']
+  workflow_dispatch:
+
+# Публикация не должна идти в два потока: параллельные сборки означали бы
+# гонку за то, чья версия попадёт под координату.
+concurrency:
+  group: xmine-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Апстримная часть версии берётся из gradle.properties (version=, её ведёт
+  # апстрим), остальное считает шаг «Версия»: <апстрим>-<ветка>-<ГГГГ-ММ-ДД>-<хеш>.
+  MAVEN_GROUP_PATH: ru/xmine/thirdparty
+  MAVEN_ARTIFACT: worldguard
+  # Раздел-кандидат пары форков, а не third-party: third-party - зеркало ЧУЖИХ
+  # артефактов, а сборку форка правим и собираем мы, поэтому у неё есть стадия.
+  MAVEN_SECTION: fork-snapshot
+  # shadowJar модуля worldguard-bukkit, классификатор dist
+  JAR_GLOB: worldguard-bukkit/build/libs/*-dist.jar
+
+jobs:
+  publish:
+    # Форки самого форка не должны пытаться публиковать в наш Reposilite.
+    if: github.repository == 'XMineServer/WorldGuard'
+    runs-on: ubuntu-latest
+
+    env:
+      XMINE_MAVEN_USERNAME: ${{ secrets.XMINE_MAVEN_USERNAME }}
+      XMINE_MAVEN_PASSWORD: ${{ secrets.XMINE_MAVEN_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 25
+        # build-logic/src/main/kotlin/buildlogic.common-java.gradle.kts:
+        # javaRelease = 25.
+        uses: actions/setup-java@v4
+        with:
+          java-version: 25
+          distribution: 'zulu'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Версия
+        # Считается из коммита, а не берётся из константы: координата обязана
+        # различать сборки. `/` в имени ветки заменяется на `-` - в версии Maven
+        # это разделитель пути в раскладке репозитория, и артефакт уехал бы не туда.
+        run: |
+          set -eu
+          UPSTREAM_VERSION=$(sed -n 's/^version=//p' gradle.properties)
+          if [ -z "$UPSTREAM_VERSION" ]; then
+            echo "::error::version is missing from gradle.properties"
+            exit 1
+          fi
+          branch=$(printf '%s' "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" | tr -c 'A-Za-z0-9.' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
+          read -r cdate chash < <(git log -1 --format='%cs %h')
+          echo "XMINE_VERSION=${UPSTREAM_VERSION}-${branch}-${cdate}-${chash}" >> "$GITHUB_ENV"
+
+      - name: Fail early without credentials
+        run: |
+          set -eu
+          if [ -z "${XMINE_MAVEN_USERNAME:-}" ] || [ -z "${XMINE_MAVEN_PASSWORD:-}" ]; then
+            echo "::error::Secrets XMINE_MAVEN_USERNAME / XMINE_MAVEN_PASSWORD are not set"
+            exit 1
+          fi
+
+      - name: Занята ли координата
+        id: exists
+        # Координата неизменяема, поэтому «уже опубликовано» - законный ответ, а не
+        # ошибка. Коды различаются намеренно: 404 - публиковать, 200 - пропустить,
+        # всё остальное - падать. 401 при неверном имени секрета иначе выглядел бы
+        # как «артефакта нет».
+        run: |
+          set -eu
+          BASE="https://maven.xmine.world/${MAVEN_SECTION}/${MAVEN_GROUP_PATH}/${MAVEN_ARTIFACT}/${XMINE_VERSION}"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+                   --user "${XMINE_MAVEN_USERNAME}:${XMINE_MAVEN_PASSWORD}" \
+                   "${BASE}/${MAVEN_ARTIFACT}-${XMINE_VERSION}.pom")
+          case "$CODE" in
+            404) echo "found=false" >> "$GITHUB_OUTPUT"; echo "Публикуем ${XMINE_VERSION}" ;;
+            200) echo "found=true"  >> "$GITHUB_OUTPUT"
+                 echo "${XMINE_VERSION} уже в разделе ${MAVEN_SECTION} - собирать нечего" ;;
+            *)   echo "::error::${BASE} ответил $CODE - это не «есть» и не «нет»"; exit 1 ;;
+          esac
+
+      - name: Test
+        if: steps.exists.outputs.found == 'false'
+        run: ./gradlew :worldguard-core:test :worldguard-bukkit:test --stacktrace
+
+      - name: Build
+        if: steps.exists.outputs.found == 'false'
+        run: ./gradlew :worldguard-bukkit:shadowJar --stacktrace
+
+      - name: Publish to Reposilite
+        if: steps.exists.outputs.found == 'false'
+        # maven-publish кладёт рядом с jar сгенерированный pom - без него координата
+        # неполна, и резолвер на той стороне спотыкается.
+        run: |
+          XMINE_MAVEN_URL="https://maven.xmine.world/${MAVEN_SECTION}" \
+            ./gradlew :worldguard-bukkit:publishXmineForkPublicationToXmineRepository \
+            -PxmineVersion="${XMINE_VERSION}" --stacktrace
+
+      - name: Verify the way XMineNode will fetch it
+        if: steps.exists.outputs.found == 'false'
+        # Сверка идёт ровно тем путём, которым пойдёт сборка образа: качаем по прямому
+        # адресу и сличаем хеш. Без этого «опубликовано» означает лишь «сервер ответил 2xx».
+        run: |
+          set -eu
+          BASE="https://maven.xmine.world/${MAVEN_SECTION}/${MAVEN_GROUP_PATH}/${MAVEN_ARTIFACT}/${XMINE_VERSION}"
+          curl --fail-with-body --silent --show-error \
+               --user "${XMINE_MAVEN_USERNAME}:${XMINE_MAVEN_PASSWORD}" \
+               -o /tmp/roundtrip.jar "${BASE}/${MAVEN_ARTIFACT}-${XMINE_VERSION}.jar"
+
+          JAR="$(ls ${JAR_GLOB} | head -n1)"
+          LOCAL="$(sha256sum "${JAR}" | cut -d' ' -f1)"
+          REMOTE="$(sha256sum /tmp/roundtrip.jar | cut -d' ' -f1)"
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "::error::Round-trip mismatch: local $LOCAL, published $REMOTE"
+            exit 1
+          fi
+
+          {
+            echo "### Published"
+            echo '```'
+            echo "$(echo "${MAVEN_GROUP_PATH}" | tr '/' '.'):${MAVEN_ARTIFACT}:${XMINE_VERSION}"
+            echo "repo:        ${MAVEN_SECTION}"
+            echo "sha256:      ${LOCAL}"
+            echo "base commit: ${GITHUB_SHA}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Уже опубликовано
+        if: steps.exists.outputs.found == 'true'
+        run: |
+          {
+            echo "### Ничего не публиковалось"
+            echo
+            echo "\`${XMINE_VERSION}\` уже лежит в разделе \`${MAVEN_SECTION}\`:"
+            echo "входы этой сборки с прошлой публикации не менялись."
+          } >> "$GITHUB_STEP_SUMMARY"
